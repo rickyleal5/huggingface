@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: huggingface-${ENVIRONMENT}-gpt2-model-server
+  labels:
+    app: huggingface-${ENVIRONMENT}-gpt2-model-server
+    project: huggingface
+    environment: ${ENVIRONMENT}
+    component: model-server
+    model: gpt2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: huggingface-${ENVIRONMENT}-gpt2-model-server
+  template:
+    metadata:
+      labels:
+        app: huggingface-${ENVIRONMENT}-gpt2-model-server
+        project: huggingface
+        environment: ${ENVIRONMENT}
+        component: model-server
+        model: gpt2
+    spec:
+      containers:
+      - name: model-server
+        image: ${ECR_REGISTRY}huggingface-gpt2-model-server:stable
+        ports:
+        - containerPort: 8000
+        env:
+        - name: MODEL_NAME
+          value: "gpt2"
+        - name: TASK
+          value: "text-generation"
+        - name: PORT
+          value: "8000"
+        - name: ENVIRONMENT
+          value: ${ENVIRONMENT}
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 45
+          periodSeconds: 15
+          timeoutSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 90
+          periodSeconds: 20
+          timeoutSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: huggingface-${ENVIRONMENT}-gpt2-model-server
+  labels:
+    app: huggingface-${ENVIRONMENT}-gpt2-model-server
+    project: huggingface
+    environment: ${ENVIRONMENT}
+    component: model-server
+    model: gpt2
+spec:
+  selector:
+    app: huggingface-${ENVIRONMENT}-gpt2-model-server
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP 

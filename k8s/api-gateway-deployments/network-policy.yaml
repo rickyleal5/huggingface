@@ -1,0 +1,69 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: huggingface-${ENVIRONMENT}-api-gateway-network-policy
+  namespace: ${NAMESPACE}
+  labels:
+    project: huggingface
+    environment: ${ENVIRONMENT}
+    component: api-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: huggingface-${ENVIRONMENT}-api-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: aws-load-balancer-controller
+      ports:
+      - port: 3000
+        protocol: TCP
+    - from:
+      - ipBlock:
+          cidr: ${VPC_CIDR}
+      ports:
+      - port: 3000
+        protocol: TCP
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+      ports:
+      - port: 3000
+        protocol: TCP
+      - port: 9443
+        protocol: TCP
+  egress:
+    - to:
+      - podSelector:
+          matchLabels:
+            app: huggingface-${ENVIRONMENT}-gpt2-model-server
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+    - ports:
+      - port: 8000
+        protocol: TCP
+    - ports:
+      - port: 3000
+        protocol: TCP
+    - ports:
+      - port: 9443
+        protocol: TCP
+    - ports:
+      - port: 443
+        protocol: TCP
+    - to:
+      - ipBlock:
+          cidr: ${VPC_CIDR}
+    - ports:
+      - port: 3000
+        protocol: TCP 

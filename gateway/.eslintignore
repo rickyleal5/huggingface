@@ -1,0 +1,7 @@
+node_modules
+.eslintignore
+.eslintrc.cjs
+package.json
+package-lock.json
+coverage
+.c8rc.json

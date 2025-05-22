@@ -1,0 +1,693 @@
+name: Deploy project
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+
+env:
+  PROJECT_NAME: huggingface
+  IMAGE_TAG: stable
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    environment: dev
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install required packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl gettext awscli
+
+      - name: Configure AWS credentials
+        if: ${{ env.ACT == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Configure AWS credentials (Local Testing)
+        if: ${{ env.ACT != '' }}
+        run: |
+          # For local testing, we use the AWS credentials from the .secrets file
+          echo "Using AWS credentials from .secrets file for local testing"
+          
+          # Set AWS region from environment or secrets
+          if [ -n "$AWS_REGION" ]; then
+            echo "Using AWS region from environment: $AWS_REGION"
+          elif [ -n "${{ secrets.AWS_REGION }}" ]; then
+            echo "Using AWS region from secrets: ${{ secrets.AWS_REGION }}"
+            export AWS_REGION=${{ secrets.AWS_REGION }}
+          else
+            echo "Error: AWS_REGION environment variable is not set"
+            exit 1
+          fi
+          
+          # Export AWS credentials to environment variables
+          export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+          export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+          export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+          
+          # Verify credentials are set
+          aws sts get-caller-identity
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.4"
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.33.0'
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: 'v3.17.3'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        if: ${{ env.ACT == '' }}
+        uses: aws-actions/amazon-ecr-login@v2
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR (Local Testing)
+        if: ${{ env.ACT != '' }}
+        run: |
+          echo "Using AWS CLI for ECR login in local testing"
+          if ! command -v aws &> /dev/null; then
+            echo "AWS CLI not found in container. This is expected when running with act."
+            echo "The workflow will continue with the assumption that AWS credentials are configured on the host."
+            exit 0
+          fi
+          
+          # Get ECR login token and login to Docker
+          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+      - name: Deploy Infrastructure
+        run: |
+          cd ${{ github.workspace }}/terraform/environments/dev
+          
+          echo "Deploying core infrastructure (VPC, Security Groups, EKS, basic IAM)..."
+          
+          # For local testing, ensure AWS credentials are properly set
+          if [ -n "$ACT" ]; then
+            echo "Using AWS credentials from environment variables for local testing"
+            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+            export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+            
+            # Ensure AWS region is set
+            if [ -n "$AWS_REGION" ]; then
+              echo "Using AWS region from environment: $AWS_REGION"
+            elif [ -n "${{ secrets.AWS_REGION }}" ]; then
+              echo "Using AWS region from secrets: ${{ secrets.AWS_REGION }}"
+              export AWS_REGION=${{ secrets.AWS_REGION }}
+            else
+              echo "Error: AWS_REGION environment variable is not set"
+              exit 1
+            fi
+          fi
+          
+          terraform init
+          terraform fmt
+          terraform validate
+          
+          # Phase 1: Core Infrastructure
+          terraform plan -out=tfplan \
+            -var="alb_listener_arn=" \
+            -var="enable_flow_logs=false" \
+            -var="cluster_oidc_issuer_url=" \
+            -var="cluster_oidc_thumbprint=" \
+            -target=module.iam.aws_iam_role.flow_logs \
+            -target=module.iam.aws_iam_role_policy.flow_logs \
+            -target=module.iam.aws_iam_role.aws_load_balancer_controller \
+            -target=module.iam.aws_iam_role_policy_attachment.aws_load_balancer_controller \
+            -target=module.iam.aws_iam_role.eks_cluster \
+            -target=module.iam.aws_iam_role.eks_node \
+            -target=module.iam.aws_iam_role_policy_attachment.eks_cluster \
+            -target=module.iam.aws_iam_role_policy_attachment.eks_service \
+            -target=module.iam.aws_iam_role_policy_attachment.eks_node \
+            -target=module.iam.aws_iam_role_policy_attachment.eks_cni \
+            -target=module.iam.aws_iam_role_policy_attachment.eks_ecr \
+            -target=module.vpc.aws_vpc.main \
+            -target=module.vpc.aws_subnet.private \
+            -target=module.vpc.aws_subnet.public \
+            -target=module.vpc.aws_internet_gateway.main \
+            -target=module.vpc.aws_eip.nat \
+            -target=module.vpc.aws_nat_gateway.main \
+            -target=module.vpc.aws_route_table.private \
+            -target=module.vpc.aws_route_table.public \
+            -target=module.vpc.aws_route_table_association.private \
+            -target=module.vpc.aws_route_table_association.public \
+            -target=module.security_groups.aws_security_group.eks_cluster \
+            -target=module.security_groups.aws_security_group.eks_worker_nodes \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_eks_cluster \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_eks_cluster \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_self_all \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_self_all \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_cluster_443 \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_services \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_vpc_cidr_nodeport \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_aws_apis \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_worker_nodes \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_worker_nodes \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_alb_443 \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_alb_443 \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_vpc_endpoints_443 \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_nodes_services \
+            -target=module.vpc_endpoints.aws_vpc_endpoint.ecr_api \
+            -target=module.vpc_endpoints.aws_vpc_endpoint.ecr_dkr \
+            -target=module.vpc_endpoints.aws_vpc_endpoint.s3 \
+            -target=module.vpc_endpoints.aws_vpc_endpoint.ssm \
+            -target=module.vpc_endpoints.aws_vpc_endpoint.ssmmessages \
+            -target=module.vpc_endpoints.aws_vpc_endpoint.ec2messages \
+            -target=module.vpc_endpoints.aws_vpc_endpoint.execute_api \
+            -target=module.eks.aws_cloudwatch_log_group.cluster \
+            -target=module.eks.aws_eks_cluster.this \
+            -target=module.eks.aws_eks_node_group.this \
+            -target=module.monitoring.aws_cloudwatch_metric_alarm.cluster_cpu_utilization \
+            -target=module.monitoring.aws_cloudwatch_metric_alarm.cluster_memory_utilization \
+            -target=module.monitoring.aws_sns_topic.alerts \
+            -target=module.monitoring.aws_sns_topic_policy.alerts \
+            -target=module.api_gateway.aws_apigatewayv2_api.this \
+            -target=module.api_gateway.aws_apigatewayv2_stage.this \
+            -target=module.api_gateway.aws_apigatewayv2_vpc_link.this \
+            -target=module.api_gateway.aws_cloudwatch_log_group.api_gateway \
+            -target=module.api_gateway.aws_cloudwatch_metric_alarm.api_gateway_4xx \
+            -target=module.api_gateway.aws_cloudwatch_metric_alarm.api_gateway_5xx
+
+          terraform apply tfplan
+          
+          echo "Phase 2: Creating ECR repositories..."
+          terraform plan -out=tfplan \
+            -target=module.ecr.aws_ecr_repository.api_gateway \
+            -target=module.ecr.aws_ecr_repository.model_server \
+            -target=module.ecr.aws_ecr_lifecycle_policy.api_gateway \
+            -target=module.ecr.aws_ecr_lifecycle_policy.model_server
+
+          terraform apply tfplan
+
+          echo "Phase 3: Deploying WAF and CloudFront..."
+          terraform plan -out=tfplan \
+            -target=module.waf.aws_wafv2_web_acl.this \
+            -target=module.cloudfront.aws_cloudfront_distribution.this
+
+          terraform apply tfplan
+
+          echo "Phase 4: Applying additional security group rules..."
+          terraform plan -out=tfplan \
+            -target=module.security_groups.aws_security_group.vpc_endpoints \
+            -target=module.security_groups.aws_security_group.api_gateway \
+            -target=module.security_groups.aws_security_group.alb \
+            -target=module.security_groups.aws_security_group.eks_cluster \
+            -target=module.security_groups.aws_security_group.eks_worker_nodes \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_worker_nodes \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_worker_nodes \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_self_all \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_self_all \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_cluster_443 \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_services \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_vpc_cidr_nodeport \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_aws_apis \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_worker_nodes \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_worker_nodes \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_alb_443 \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_alb_443 \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.cluster_ingress_vpc_endpoints_443 \
+            -target=module.security_groups.aws_security_group_rule.cluster_egress_nodes_services \
+            -target=module.security_groups.aws_security_group_rule.api_gateway_ingress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.api_gateway_egress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.api_gateway_ingress_vpc_endpoints_443 \
+            -target=module.security_groups.aws_security_group_rule.api_gateway_egress_vpc_endpoints_443 \
+            -target=module.security_groups.aws_security_group_rule.api_gateway_ingress_client_443 \
+            -target=module.security_groups.aws_security_group_rule.api_gateway_egress_client_443 \
+            -target=module.security_groups.aws_security_group_rule.api_gateway_ingress_client_3000 \
+            -target=module.security_groups.aws_security_group_rule.api_gateway_egress_client_3000 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_ingress_vpc_cidr_443 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_egress_vpc_cidr_443 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_ingress_api_gateway_443 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_egress_api_gateway_443 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_ingress_api_gateway_3000 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_egress_api_gateway_3000 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_ingress_alb_443 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_egress_alb_443 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_ingress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.vpc_endpoints_egress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_api_gateway_3000 \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_api_gateway_3000 \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_api_gateway_443 \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_api_gateway_443 \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_vpc_endpoints_3000 \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_vpc_endpoints_3000 \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_vpc_endpoints_443 \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_vpc_endpoints_443 \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_worker_nodes_3000 \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_worker_nodes_3000 \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_eks_cluster \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_eks_cluster \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_alb_3000 \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_alb_443 \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_alb_443 \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_aws_apis \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_http_80 \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_alb_9443 \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_egress_alb_9443 \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_worker_nodes_9443 \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_worker_nodes_9443 \
+            -target=module.security_groups.aws_security_group_rule.worker_nodes_ingress_control_plane_to_webhook \
+            -target=module.security_groups.aws_security_group_rule.alb_ingress_worker_nodes_webhook_443 \
+            -target=module.security_groups.aws_security_group_rule.alb_egress_worker_nodes_webhook_443
+
+          terraform apply tfplan
+
+          echo "Core infrastructure deployment complete!"
+
+      - name: Build and Push Docker Images
+        run: |
+          # Build images
+          echo "Building Docker images..."
+          docker build -t huggingface-api-gateway:${{ env.IMAGE_TAG }} ${{ github.workspace }}/gateway
+          docker build -t huggingface-gpt2-model-server:${{ env.IMAGE_TAG }} -f ${{ github.workspace }}/huggingface-models/models/gpt2/Dockerfile ${{ github.workspace }}/huggingface-models
+
+          # Tag images
+          echo "Tagging images..."
+          docker tag huggingface-api-gateway:${{ env.IMAGE_TAG }} ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/huggingface-api-gateway:${{ env.IMAGE_TAG }}
+          docker tag huggingface-gpt2-model-server:${{ env.IMAGE_TAG }} ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/huggingface-gpt2-model-server:${{ env.IMAGE_TAG }}
+
+          # Push images
+          echo "Pushing images to ECR..."
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/huggingface-api-gateway:${{ env.IMAGE_TAG }}
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/huggingface-gpt2-model-server:${{ env.IMAGE_TAG }}
+
+      - name: Deploy Kubernetes Resources
+        run: |
+          # Set environment variables
+          export ENVIRONMENT=${{ github.ref == 'refs/heads/main' && 'dev' || 'prod' }}
+          export CLUSTER_NAME="${PROJECT_NAME}-${ENVIRONMENT}-cluster"
+          export NAMESPACE="${PROJECT_NAME}-${ENVIRONMENT}"
+          export VALIDATE="false"
+          export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/"
+
+          # Get VPC and security group IDs from Terraform output
+          echo "Getting VPC and security group IDs..."
+          cd ${{ github.workspace }}/terraform/environments/${ENVIRONMENT}
+          export VPC_ID=$(terraform output -raw vpc_id)
+          export VPC_CIDR=$(terraform output -raw vpc_cidr)
+          export API_GATEWAY_SECURITY_GROUP_ID=$(terraform output -raw api_gateway_security_group_id)
+          export ALB_SECURITY_GROUP_ID=$(terraform output -raw alb_security_group_id)
+          export EKS_CLUSTER_SECURITY_GROUP_ID=$(terraform output -raw eks_cluster_security_group_id)
+          cd ${{ github.workspace }}
+
+          if [ -z "$VPC_ID" ] || [ -z "$VPC_CIDR" ] || [ -z "$API_GATEWAY_SECURITY_GROUP_ID" ] || [ -z "$ALB_SECURITY_GROUP_ID" ] || [ -z "$EKS_CLUSTER_SECURITY_GROUP_ID" ]; then
+            echo "Error: Could not find one or more required values from Terraform output"
+            exit 1
+          fi
+
+          # Set kubectl validation flag
+          VALIDATE_FLAG=""
+          if [ "$VALIDATE" = "false" ]; then
+            VALIDATE_FLAG="--validate=false"
+          fi
+
+          # Get EKS cluster credentials
+          echo "Getting EKS cluster credentials..."
+          aws eks update-kubeconfig --region ${{ secrets.AWS_REGION }} --name ${CLUSTER_NAME}
+
+          # Create namespace if it doesn't exist
+          echo "Creating namespace..."
+          kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f - ${VALIDATE_FLAG}
+
+          # Set up OIDC provider for the cluster
+          echo "Setting up OIDC provider for the cluster..."
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          OIDC_ID=""
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            OIDC_ID=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
+            if [ ! -z "$OIDC_ID" ]; then
+              break
+            fi
+            echo "Waiting for OIDC ID to be available... (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            sleep 10
+          done
+
+          if [ -z "$OIDC_ID" ]; then
+            echo "Error: Could not get OIDC ID after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+          # Get OIDC thumbprint
+          echo "Getting OIDC thumbprint..."
+          OIDC_ISSUER_URL="oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com"
+          OIDC_THUMBPRINT=$(echo | openssl s_client -servername ${OIDC_ISSUER_URL} -showcerts -connect ${OIDC_ISSUER_URL}:443 2>/dev/null | openssl x509 -fingerprint -sha1 -noout | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
+          if [ -z "$OIDC_THUMBPRINT" ]; then
+            echo "Error: Could not get OIDC thumbprint"
+            exit 1
+          fi
+
+          # Apply OIDC-dependent Terraform resources
+          echo "Applying OIDC-dependent Terraform resources..."
+          cd ${{ github.workspace }}/terraform/environments/${ENVIRONMENT}
+          terraform plan -out=tfplan \
+            -var="alb_listener_arn=" \
+            -var="cluster_oidc_issuer_url=https://oidc.eks.${{ secrets.AWS_REGION }}.amazonaws.com/id/${OIDC_ID}" \
+            -var="cluster_oidc_thumbprint=${OIDC_THUMBPRINT}"
+          terraform apply tfplan
+
+          # Get the Load Balancer Controller role ARN
+          export LOAD_BALANCER_CONTROLLER_ROLE_ARN=$(terraform output -raw load_balancer_controller_role_arn)
+          cd ${{ github.workspace }}
+
+          if [ -z "$LOAD_BALANCER_CONTROLLER_ROLE_ARN" ]; then
+            echo "Error: Could not find Load Balancer Controller role ARN from Terraform output"
+            exit 1
+          fi
+
+          # Wait for OIDC provider to be fully propagated
+          echo "Waiting for OIDC provider to be fully propagated..."
+          sleep 30
+
+          # Set all required environment variables for Kubernetes manifests
+          echo "Setting up environment variables for Kubernetes manifests..."
+          export ENVIRONMENT=${ENVIRONMENT}
+          export NAMESPACE=${NAMESPACE}
+          export ECR_REGISTRY=${ECR_REGISTRY}
+          export cluster_name=${CLUSTER_NAME}
+          export load_balancer_controller_role_arn=${LOAD_BALANCER_CONTROLLER_ROLE_ARN}
+
+          # Verify AWS resources
+          echo "Verifying AWS resources..."
+          
+          # Verify VPC endpoints if using private subnets
+          echo "Verifying VPC endpoints..."
+          aws ec2 describe-vpc-endpoints \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query 'VpcEndpoints[*].{Service:ServiceName,State:State}' \
+            --output json | cat
+
+          # Verify security groups
+          echo "Verifying security group configurations..."
+          echo "API Gateway security group:"
+          aws ec2 describe-security-groups \
+            --group-ids ${API_GATEWAY_SECURITY_GROUP_ID} \
+            --query 'SecurityGroups[*].{Name:GroupName,Id:GroupId}' \
+            --output json | cat
+          
+          echo "ALB security group:"
+          aws ec2 describe-security-groups \
+            --group-ids ${ALB_SECURITY_GROUP_ID} \
+            --query 'SecurityGroups[*].{Name:GroupName,Id:GroupId}' \
+            --output json | cat
+          
+          echo "EKS Cluster security group:"
+          aws ec2 describe-security-groups \
+            --group-ids ${EKS_CLUSTER_SECURITY_GROUP_ID} \
+            --query 'SecurityGroups[*].{Name:GroupName,Id:GroupId}' \
+            --output json | cat
+
+          # Install AWS Load Balancer Controller using Helm
+          echo "Installing AWS Load Balancer Controller using Helm..."
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+
+          # Install or upgrade the controller
+          if ! helm status aws-load-balancer-controller -n kube-system &> /dev/null; then
+            echo "Installing AWS Load Balancer Controller..."
+            helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+              -n kube-system \
+              --set clusterName=${CLUSTER_NAME} \
+              --set serviceAccount.create=true \
+              --set serviceAccount.name=aws-load-balancer-controller \
+              --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${LOAD_BALANCER_CONTROLLER_ROLE_ARN} \
+              --set region=${{ secrets.AWS_REGION }} \
+              --set vpcId=${VPC_ID}
+          else
+            echo "Updating AWS Load Balancer Controller..."
+            helm upgrade aws-load-balancer-controller eks/aws-load-balancer-controller \
+              -n kube-system \
+              --set clusterName=${CLUSTER_NAME} \
+              --set serviceAccount.create=true \
+              --set serviceAccount.name=aws-load-balancer-controller \
+              --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${LOAD_BALANCER_CONTROLLER_ROLE_ARN} \
+              --set region=${{ secrets.AWS_REGION }} \
+              --set vpcId=${VPC_ID}
+          fi
+
+          # Wait for AWS Load Balancer Controller to be ready
+          echo "Waiting for AWS Load Balancer Controller to be ready..."
+          kubectl wait --for=condition=available --timeout=300s deployment/aws-load-balancer-controller -n kube-system
+
+          # Wait for controller to be fully operational
+          echo "Waiting for AWS Load Balancer Controller to be fully operational..."
+          sleep 90
+
+          # Apply Network Policies first
+          echo "Applying Network Policies..."
+          echo "Applying API Gateway Network Policy..."
+          envsubst < ${{ github.workspace }}/k8s/api-gateway-deployments/network-policy.yaml | kubectl apply -n ${NAMESPACE} -f - ${VALIDATE_FLAG}
+          echo "Applying Model Server Network Policy..."
+          envsubst < ${{ github.workspace }}/k8s/model-deployments/model-network-policy.yaml | kubectl apply -n ${NAMESPACE} -f - ${VALIDATE_FLAG}
+
+          # Apply Model deployments first (since API Gateway depends on it)
+          echo "Applying Model deployments..."
+          envsubst < ${{ github.workspace }}/k8s/model-deployments/gpt2-deployment.yaml | kubectl apply -n ${NAMESPACE} -f - ${VALIDATE_FLAG}
+
+          # Wait for model server to be ready (increased timeout due to longer initial delay)
+          echo "Waiting for model server to be ready..."
+          kubectl wait -n ${NAMESPACE} --for=condition=available --timeout=600s deployment/${PROJECT_NAME}-${ENVIRONMENT}-gpt2-model-server
+
+          # Apply API Gateway deployment
+          echo "Applying API Gateway deployment..."
+          envsubst < ${{ github.workspace }}/k8s/api-gateway-deployments/api-gateway-deployment.yaml | kubectl apply -n ${NAMESPACE} -f - ${VALIDATE_FLAG}
+
+          # Apply API Gateway Ingress
+          echo "Applying API Gateway Ingress..."
+          envsubst < ${{ github.workspace }}/k8s/api-gateway-deployments/api-gateway-ingress.yaml | kubectl apply -n ${NAMESPACE} -f - ${VALIDATE_FLAG}
+
+          # Wait for API Gateway to be ready
+          echo "Waiting for API Gateway to be ready..."
+          kubectl wait -n ${NAMESPACE} --for=condition=available --timeout=300s deployment/${PROJECT_NAME}-${ENVIRONMENT}-api-gateway
+
+          # Wait for ALB to be created by the AWS Load Balancer Controller
+          echo "Waiting for ALB to be created..."
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          ALB_ARN=""
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            ALB_ARN=$(aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?contains(LoadBalancerName, 'huggingface${{ github.ref == 'refs/heads/main' && 'dev' || 'prod' }}')].LoadBalancerArn" \
+              --output text)
+            
+            if [ ! -z "$ALB_ARN" ]; then
+              break
+            fi
+            
+            echo "Waiting for ALB to be created... (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            sleep 30
+          done
+
+          if [ -z "$ALB_ARN" ]; then
+            echo "Error: Could not find ALB ARN after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+          # Verify the ALB is internal (not internet-facing)
+          echo "Verifying ALB is internal..."
+          ALB_SCHEME=$(aws elbv2 describe-load-balancers \
+            --load-balancer-arns ${ALB_ARN} \
+            --query "LoadBalancers[0].Scheme" \
+            --output text)
+
+          if [ "$ALB_SCHEME" != "internal" ]; then
+            echo "Warning: ALB is not internal (${ALB_SCHEME}). It should be internal for proper Client Request Flow."
+            echo "Check your Ingress annotations to ensure alb.ingress.kubernetes.io/scheme: internal is set."
+          else
+            echo "ALB is correctly configured as internal."
+          fi
+
+          # Get the ALB listener ARN
+          echo "Getting ALB listener ARN..."
+          export ALB_LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn ${ALB_ARN} \
+            --query "Listeners[0].ListenerArn" \
+            --output text)
+
+          if [ -z "$ALB_LISTENER_ARN" ]; then
+            echo "Error: Could not find ALB listener ARN"
+            exit 1
+          fi
+
+          echo "ALB Listener ARN: ${ALB_LISTENER_ARN}"
+
+          # Get target group ARN
+          echo "Getting target group ARN..."
+          export TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \
+            --load-balancer-arn ${ALB_ARN} \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text)
+
+          if [ -z "$TARGET_GROUP_ARN" ]; then
+            echo "Error: Could not find target group ARN"
+            exit 1
+          fi
+
+          # Wait for target group to be healthy
+          echo "Waiting for target group to be healthy..."
+          MAX_RETRIES=30
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            health_status=$(aws elbv2 describe-target-health \
+              --target-group-arn ${TARGET_GROUP_ARN} \
+              --query 'TargetHealthDescriptions[*].TargetHealth.State' \
+              --output text)
+            
+            if [[ $health_status == *"healthy"* ]]; then
+              echo "Target group is healthy!"
+              break
+            fi
+            
+            echo "Target group not yet healthy, retrying in 10 seconds... (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            sleep 10
+          done
+
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Error: Target group did not become healthy after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+          # Update API Gateway integration with ALB listener
+          echo "Updating API Gateway integration with ALB listener..."
+          cd ${{ github.workspace }}/terraform/environments/${ENVIRONMENT}
+          terraform apply -var="alb_listener_arn=${ALB_LISTENER_ARN}" -auto-approve
+          cd ${{ github.workspace }}
+
+          # Wait additional time for DNS propagation and health checks
+          echo "Waiting for DNS propagation and health checks..."
+          sleep 120
+
+      - name: Test Endpoint
+        run: |
+          # Get API Gateway endpoint from Terraform output
+          cd ${{ github.workspace }}/terraform/environments/${{ github.ref == 'refs/heads/main' && 'dev' || 'prod' }}
+          export API_ENDPOINT=$(terraform output -raw api_gateway_endpoint)
+          cd ${{ github.workspace }}
+          
+          if [ -z "$API_ENDPOINT" ]; then
+            echo "Error: Could not find API Gateway endpoint"
+            exit 1
+          fi
+          
+          # Wait additional time for DNS propagation and health checks
+          echo "Waiting for DNS propagation and health checks..."
+          sleep 120
+          echo "API Gateway endpoint: ${API_ENDPOINT}"
+          
+          # Test health endpoint with retries
+          echo "Testing API Gateway health endpoint..."
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          RETRY_DELAY=30
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
+            
+            # Try to get the health endpoint
+            if response=$(curl -s --max-time 30 ${API_ENDPOINT}/health); then
+              echo "Health check response: $response"
+              if [[ $response == *"healthy"* ]]; then
+                echo "Health check successful!"
+                break
+              else
+                echo "Health check returned unexpected response: $response"
+              fi
+            else
+              echo "Health check failed with curl error"
+            fi
+            
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Retrying in $RETRY_DELAY seconds..."
+              sleep $RETRY_DELAY
+            fi
+          done
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Error: Health check failed after $MAX_RETRIES attempts"
+            echo "Last API Gateway endpoint: ${API_ENDPOINT}"
+            echo "Please check the API Gateway logs and configuration"
+            exit 1
+          fi
+          
+          # Test model endpoint
+          echo "Testing model endpoint..."
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
+            
+            # Try to get the model endpoint
+            if response=$(curl -s --max-time 30 -X POST ${API_ENDPOINT}/predict \
+              -H "Content-Type: application/json" \
+              -d '{"text": "Hello, how are you?"}'); then
+              echo "Model response: $response"
+              if [[ $response == *"generated_text"* ]]; then
+                echo "Model test successful!"
+                break
+              else
+                echo "Model test returned unexpected response: $response"
+              fi
+            else
+              echo "Model test failed with curl error"
+            fi
+            
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Retrying in $RETRY_DELAY seconds..."
+              sleep $RETRY_DELAY
+            fi
+          done
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Error: Model test failed after $MAX_RETRIES attempts"
+            echo "Last API Gateway endpoint: ${API_ENDPOINT}"
+            echo "Please check the API Gateway and model server logs"
+            exit 1
+          fi
+          
+          echo "Deployment verification completed successfully!" 

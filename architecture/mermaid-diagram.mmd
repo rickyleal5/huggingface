@@ -1,0 +1,126 @@
+graph TB
+    %% External Components
+    User((User))
+    Internet((Internet))
+    
+    %% AWS CloudFront
+    subgraph AWS["AWS Cloud"]
+        subgraph CloudFront["CloudFront"]
+            CF_Distribution["Distribution"]
+            CF_SSL["SSL/TLS"]
+            CF_Cache["Cache"]
+            CF_Security["Edge Security"]
+        end
+        
+        %% AWS WAF
+        subgraph WAF["AWS WAF"]
+            WAF_Rules["Managed Rules"]
+            WAF_RateLimit["Rate Limiting"]
+            WAF_Security["Security Rules"]
+        end
+        
+        %% AWS API Gateway
+        subgraph APIGW["API Gateway"]
+            APIGW_Stage["HTTP API Stage"]
+            APIGW_Route["Route: ANY /{proxy+}"]
+            APIGW_Integration["Integration: HTTP_PROXY"]
+            APIGW_VPCLink["VPC Link"]
+            APIGW_SG["Security Group"]
+        end
+        
+        %% VPC
+        subgraph VPC["VPC (10.0.0.0/16)"]
+            %% EKS Cluster
+            subgraph EKS["EKS Cluster"]
+                subgraph NS["huggingface-dev Namespace"]
+                    %% API Gateway Pod
+                    subgraph APIGW_Pod["API Gateway Pod"]
+                        APIGW_Container["Container: api-gateway"]
+                        APIGW_Probes["Health Probes"]
+                    end
+                    
+                    %% Model Pods
+                    subgraph Model_Pods["Model Pods"]
+                        GPT2_Container["Container: gpt2-model-server"]
+                        Other_Models["Other Model Servers"]
+                    end
+                    
+                    %% Services
+                    APIGW_Service["Service: huggingface-dev-api-gateway"]
+                    Model_Service["Service: huggingface-dev-model-server"]
+                end
+            end
+            
+            %% AWS Load Balancer Controller
+            subgraph ALB_Controller["AWS Load Balancer Controller"]
+                ALB_Ingress["Ingress Controller"]
+                ALB_Config["ALB Configuration"]
+                ALB_Health["Health Checks"]
+            end
+            
+            %% Network Components
+            PrivateSubnets["Private Subnets"]
+            PublicSubnets["Public Subnets"]
+            NATGateway["NAT Gateway"]
+            InternetGateway["Internet Gateway"]
+        end
+        
+        %% CloudWatch
+        subgraph CloudWatch["CloudWatch"]
+            APIGW_Logs["API Gateway Logs"]
+            APIGW_Alarms["API Gateway Alarms"]
+            WAF_Logs["WAF Logs"]
+            CF_Logs["CloudFront Logs"]
+        end
+    end
+    
+    %% Traffic Flow
+    User -->|HTTPS| Internet
+    Internet -->|HTTPS| CF_Distribution
+    CF_Distribution -->|HTTPS| WAF_Rules
+    WAF_Rules -->|HTTPS| APIGW_Stage
+    APIGW_Stage -->|Route| APIGW_Route
+    APIGW_Route -->|Forward| APIGW_Integration
+    APIGW_Integration -->|VPC Link| APIGW_VPCLink
+    APIGW_VPCLink -->|HTTP| ALB_Ingress
+    ALB_Ingress -->|Forward| ALB_Config
+    ALB_Config -->|HTTP| APIGW_Service
+    APIGW_Service -->|HTTP| APIGW_Container
+    APIGW_Container -->|HTTP| Model_Service
+    Model_Service -->|HTTP| Model_Pods
+    
+    %% Security Groups
+    APIGW_SG -->|Allow 3000| ALB_Config
+    ALB_Config -->|Allow 3000| APIGW_SG
+    
+    %% Network Flow
+    InternetGateway -->|Public Traffic| PublicSubnets
+    PublicSubnets -->|Private Traffic| PrivateSubnets
+    PrivateSubnets -->|Outbound| NATGateway
+    NATGateway -->|Internet| Internet
+    
+    %% Logging
+    APIGW_Stage -->|Logs| APIGW_Logs
+    APIGW_Stage -->|Metrics| APIGW_Alarms
+    WAF_Rules -->|Logs| WAF_Logs
+    CF_Distribution -->|Logs| CF_Logs
+    
+    %% Health Checks
+    ALB_Health -->|Health Check| APIGW_Probes
+    
+    %% Styling
+    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:white
+    classDef vpc fill:#7AA116,stroke:#232F3E,stroke-width:2px,color:white
+    classDef eks fill:#7AA116,stroke:#232F3E,stroke-width:2px,color:white
+    classDef pod fill:#7AA116,stroke:#232F3E,stroke-width:2px,color:white
+    classDef service fill:#7AA116,stroke:#232F3E,stroke-width:2px,color:white
+    classDef security fill:#D13212,stroke:#232F3E,stroke-width:2px,color:white
+    classDef monitoring fill:#7AA116,stroke:#232F3E,stroke-width:2px,color:white
+    
+    class AWS,APIGW,CloudWatch,CloudFront,WAF aws
+    class VPC,PrivateSubnets,PublicSubnets,NATGateway,InternetGateway vpc
+    class EKS,NS eks
+    class APIGW_Pod,Model_Pods pod
+    class APIGW_Service,Model_Service service
+    class APIGW_SG,ALB_Config,WAF_Security,CF_Security security
+    class APIGW_Logs,APIGW_Alarms,WAF_Logs,CF_Logs monitoring

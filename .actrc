@@ -1,0 +1,36 @@
+# Environment variables
+PROJECT_NAME=huggingface
+ECR_REGISTRY=<YOUR-AWS-ACCOUNT-ID>.dkr.ecr.us-east-1.amazonaws.com/
+IMAGE_TAG=stable
+AWS_PROFILE=<AWS_SSO_PROFILE>
+
+# GitHub Actions specific variables
+GITHUB_WORKSPACE=/home/user/github/huggingface
+GITHUB_SHA=test-sha
+GITHUB_REF=refs/heads/main
+GITHUB_TOKEN=
+# Kubernetes specific variables
+KUBE_CONFIG_PATH=~/.kube/config
+HELM_HOME=~/.helm
+ENVIRONMENT=dev
+NAMESPACE=huggingface-dev
+CLUSTER_NAME=huggingface-dev-cluster
+
+# Terraform specific variables
+TF_WORKSPACE=dev
+TF_VAR_environment=dev
+TF_VAR_project_name=huggingface
+TF_VAR_aws_region=us-east-1
+TF_VAR_aws_account_id=<YOUR-AWS-ACCOUNT-ID>
+TF_VAR_vpc_cidr=10.0.0.0/16
+TF_VAR_availability_zones=["us-east-1a", "us-east-1b"]
+TF_VAR_eks_cluster_name=huggingface-dev-cluster
+TF_VAR_eks_cluster_version=1.32
+TF_VAR_admin_users=["admin@example.com"]
+TF_VAR_developer_users=["developer@example.com"]
+TF_VAR_alert_email=admin@example.com
+TF_VAR_bucket_name=huggingface-terraform-state-dev
+TF_VAR_enable_flow_logs=false
+TF_VAR_flow_logs_retention=30
+TF_VAR_log_retention_days=30
+TF_VAR_allowed_origins=["*"] 

@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: huggingface-${ENVIRONMENT}-api-gateway
+  labels:
+    app: huggingface-${ENVIRONMENT}-api-gateway
+    project: huggingface
+    environment: ${ENVIRONMENT}
+    component: api-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: huggingface-${ENVIRONMENT}-api-gateway
+  template:
+    metadata:
+      labels:
+        app: huggingface-${ENVIRONMENT}-api-gateway
+        project: huggingface
+        environment: ${ENVIRONMENT}
+        component: api-gateway
+      annotations:
+        alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=60,slow_start.duration_seconds=30
+        alb.ingress.kubernetes.io/load-balancer-attributes: routing.http.drop_invalid_header_fields.enabled=true,idle_timeout.timeout_seconds=120
+        alb.ingress.kubernetes.io/scheme: internal
+        alb.ingress.kubernetes.io/target-type: ip
+        alb.ingress.kubernetes.io/healthcheck-path: /health
+        alb.ingress.kubernetes.io/healthcheck-port: "3000"
+        alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+        alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+        alb.ingress.kubernetes.io/unhealthy-threshold-count: "5"
+        alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+        alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "10"
+        alb.ingress.kubernetes.io/success-codes: "200"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: api-gateway
+        image: ${ECR_REGISTRY}huggingface-api-gateway:stable
+        ports:
+        - containerPort: 3000
+          name: http
+          protocol: TCP
+        env:
+        - name: PORT
+          value: "3000"
+        - name: NODE_ENV
+          value: ${ENVIRONMENT}
+        - name: GPT2_SERVICE_URL
+          value: "http://huggingface-${ENVIRONMENT}-gpt2-model-server:8000"
+        - name: RATE_LIMIT_WINDOW_MS
+          value: "60000"  # 1 minute window
+        - name: RATE_LIMIT_MAX_REQUESTS
+          value: "100"    # 100 requests per minute
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          failureThreshold: 30
+          periodSeconds: 10
+          initialDelaySeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: huggingface-${ENVIRONMENT}-api-gateway
+  namespace: ${NAMESPACE}
+  labels:
+    app: huggingface-${ENVIRONMENT}-api-gateway
+    component: api-gateway
+    environment: ${ENVIRONMENT}
+    project: huggingface
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP
+  selector:
+    app: huggingface-${ENVIRONMENT}-api-gateway 

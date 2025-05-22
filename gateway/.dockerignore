@@ -1,0 +1,12 @@
+# Test files
+test/
+**/*.test.ts
+**/*.spec.ts
+combined.log
+error.log
+
+# Configuration files
+.eslintrc.cjs
+.eslintignore
+.c8rc.json
+.nvmrc

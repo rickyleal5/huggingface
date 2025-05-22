@@ -1,0 +1,35 @@
+# Environment variables
+.env
+
+# Node.js
+gateway/node_modules/
+gateway/.npm
+
+# TypeScript
+gateway/dist/
+gateway/*.tsbuildinfo
+gateway/.tscache/
+
+# Gateway coverage and logs
+gateway/coverage/
+gateway/combined.log
+gateway/error.log
+
+# Terraform
+terraform/environments/*/tfplan
+terraform/environments/*/.terraform
+terraform/environments/*/tfplan.json.gz
+terraform/environments/*/*.tfstate
+terraform/environments/*/*.tfstate.*
+terraform/environments/*/*.tfstate.backup
+terraform/environments/*/.terraform.lock.hcl
+terraform/environments/*/.terraformrc
+terraform/environments/*/terraform.rc
+
+# Kubernetes
+k8s/kubeconfig
+k8s/kubeconfig.yaml
+
+# AWS
+.aws/
+aws.json

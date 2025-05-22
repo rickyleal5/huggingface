@@ -1,0 +1,20 @@
+# This is a local service for the API Gateway. It is used to test the API Gateway locally.
+# It is not used in the production environment.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: huggingface-${ENVIRONMENT}-api-gateway-local
+  labels:
+    app: huggingface-${ENVIRONMENT}-api-gateway
+    project: huggingface
+    environment: ${ENVIRONMENT}
+    component: api-gateway
+spec:
+  selector:
+    app: huggingface-${ENVIRONMENT}-api-gateway
+  ports:
+  - port: 3000
+    targetPort: 3000
+    protocol: TCP
+  type: LoadBalancer 
